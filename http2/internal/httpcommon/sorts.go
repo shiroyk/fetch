@@ -7,8 +7,8 @@ import (
 	"sync"
 )
 
-// A headerSorter implements sort.Interface by sorting a []keyValues
-// by the given order, if not nil, or by Key otherwise.
+// A headerSorter implements sort.Interface by sorting a []string
+// by the given order, if not nil, or lexicographically otherwise.
 // It's used as a pointer, so it can fit in a sort.Interface
 // value without allocation.
 type headerSorter struct {
@@ -46,12 +46,12 @@ func sortedKeyValues(header http.Header) (keys []string) {
 	if cap(sorter.keys) < len(header) {
 		sorter.keys = make([]string, 0, len(header))
 	}
+	sorter.order = nil
 
 	keys = sorter.keys[:0]
 	for k := range header {
 		keys = append(keys, k)
 	}
-
 	sorter.keys = keys
 	sort.Sort(sorter)
 	return keys
@@ -69,7 +69,7 @@ func sortedKeyValuesBy(header http.Header, headerOrder []string) (keys []string)
 		keys = append(keys, k)
 	}
 	sorter.keys = keys
-	sorter.order = make(map[string]int)
+	sorter.order = make(map[string]int, len(headerOrder))
 	for i, v := range headerOrder {
 		sorter.order[v] = i
 	}

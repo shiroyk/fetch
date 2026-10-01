@@ -1,0 +1,502 @@
+{
+  "version": 2,
+  "base_go": "go1.27.1",
+  "upstream_root": "src/net/http/internal",
+  "upstream_package": "http2",
+  "fork_module": "github.com/shiroyk/fetch",
+  "fork_package": "github.com/shiroyk/fetch/http2",
+  "fork_dir": "http2",
+  "min_go": "1.27",
+  "notes": [
+    "The vendored source is the standard library's net/http/internal/http2, resolved from $(go env GOROOT), not a module cache: as of Go 1.27 that package is the source of truth and golang.org/x/net/http2 only receives critical fixes.",
+    "Re-basing therefore means re-copying from a Go toolchain, and base_go/min_go move with it. A machine with a different toolchain re-bases against that toolchain's sources.",
+    "Every site that edits an upstream-owned file leaves a '// fork: <site-id>' marker at the edit point; scripts/minimal-diff-check.sh fails when one is missing."
+  ],
+  "files": {
+    "allowlist": [
+      "api.go",
+      "ascii.go",
+      "client_conn_pool.go",
+      "config.go",
+      "databuffer.go",
+      "errors.go",
+      "flow.go",
+      "frame.go",
+      "http2.go",
+      "pipe.go",
+      "transport.go"
+    ],
+    "fork_owned": [
+      "patch.go",
+      "patch_e2e_test.go",
+      "patch_fingerprint_test.go",
+      "patch_test.go"
+    ],
+    "exclude": [
+      "*_test.go",
+      "ciphers.go",
+      "gotrack.go",
+      "server.go",
+      "write.go",
+      "writesched*.go"
+    ],
+    "nested": {
+      "copy": [
+        {
+          "from": "httpcommon",
+          "to": "http2/internal/httpcommon",
+          "exclude": ["*_test.go"],
+          "rewrite_import_path": {
+            "from": "net/http/internal/httpcommon",
+            "to": "github.com/shiroyk/fetch/http2/internal/httpcommon"
+          },
+          "fork_owned": ["sorts.go"],
+          "patched": ["httpcommon.go"],
+          "sites": [
+            "site-internal-import-rewrite",
+            "site-httpcommon-header-order",
+            "site-httpcommon-drop-server-api"
+          ]
+        },
+        {
+          "from": "httpsfv",
+          "to": "http2/internal/httpsfv",
+          "exclude": ["*_test.go"],
+          "rewrite_import_path": {
+            "from": "net/http/internal/httpsfv",
+            "to": "github.com/shiroyk/fetch/http2/internal/httpsfv"
+          },
+          "fork_owned": [],
+          "patched": [],
+          "sites": ["site-internal-import-rewrite"]
+        }
+      ],
+      "drop": []
+    }
+  },
+  "sites": [
+    {
+      "id": "site-file-subset",
+      "layer": "L2",
+      "kind": "subset-select",
+      "summary": "Only the client-side closure of the standard library package is vendored.",
+      "targets": [
+        {
+          "file": "http2/",
+          "symbol": "package file list"
+        }
+      ],
+      "anchors": [
+        "files.allowlist, files.exclude and files.nested are the complete rule.",
+        "A file is needed when the vendored package fails to compile without it."
+      ],
+      "invariants": [
+        "Every allowlist entry exists in the toolchain's net/http/internal/http2.",
+        "No upstream test file is vendored.",
+        "Server-only files (server.go, write.go, writesched*.go, ciphers.go, gotrack.go) stay out; the client subset compiles without them.",
+        "Dropped packages stay importable from the standard library, e.g. hpack comes from golang.org/x/net/http2/hpack."
+      ],
+      "verify": ["scripts/subset-check.sh"]
+    },
+    {
+      "id": "site-internal-import-rewrite",
+      "layer": "L2",
+      "kind": "import-rewrite",
+      "summary": "The copied packages keep their import paths rewritten, and net/http/internal references are localised.",
+      "targets": [
+        {
+          "file": "http2/frame.go",
+          "symbol": "net/http/internal/httpsfv import"
+        },
+        {
+          "file": "http2/api.go",
+          "symbol": "net/http/internal sentinels"
+        },
+        {
+          "file": "http2/transport.go",
+          "symbol": "net/http/internal ErrRequestCanceled"
+        },
+        {
+          "file": "http2/internal/httpcommon/",
+          "symbol": "package httpcommon"
+        },
+        {
+          "file": "http2/internal/httpsfv/",
+          "symbol": "package httpsfv"
+        }
+      ],
+      "anchors": [
+        "Any import of a net/http/internal/... path.",
+        "The bare net/http/internal import used for the ErrAbortHandler, ErrBodyNotAllowed, ErrSkipAltProtocol, ErrRequestCanceled and DetectContentType symbols."
+      ],
+      "invariants": [
+        "No file under http2/ imports a net/http/internal/... path.",
+        "The standard library avoids net/http only to break an import cycle; the fork is a separate module and may import it, so the sentinels become http.ErrAbortHandler, http.ErrBodyNotAllowed and http.ErrSkipAltProtocol.",
+        "ErrRequestCanceled is internal to the client, so a local errors.New replaces it; its identity never crosses the package boundary.",
+        "Every internal package the vendored files import has a matching copy under http2/internal/."
+      ],
+      "verify": ["scripts/subset-check.sh", "scripts/httpcommon-diff.sh"]
+    },
+    {
+      "id": "site-api-drop-server",
+      "layer": "L2",
+      "kind": "delete-symbol",
+      "summary": "api.go loses the server-facing surface and initialises the two variables net/http normally fills in.",
+      "targets": [
+        {
+          "file": "http2/api.go",
+          "symbol": "ServerConfig, Handler, ResponseWriter, PushOptions, ServerRequest, ConnState"
+        }
+      ],
+      "anchors": [
+        "Type declarations after TransportConfig that reference net.Conn, log.Logger or multipart.Form.",
+        "NoBody and LocalAddrContextKey, which net/http assigns into the standard library copy at init time."
+      ],
+      "invariants": [
+        "ClientRequest, ClientResponse, Header and TransportConfig stay."
+        ,
+        "NoBody and LocalAddrContextKey are initialised from net/http in the fork's own init.",
+        "The remaining file needs no net/multipart/log imports."
+      ],
+      "verify": ["scripts/verify.sh", "scripts/minimal-diff-check.sh"]
+    },
+    {
+      "id": "site-config-drop-server",
+      "layer": "L2",
+      "kind": "delete-symbol",
+      "summary": "configFromServer is dropped because the server half of the package is not vendored.",
+      "targets": [
+        {
+          "file": "http2/config.go",
+          "symbol": "configFromServer"
+        }
+      ],
+      "anchors": [
+        "Helper taking a ServerConfig and returning Config."
+      ],
+      "invariants": [
+        "configFromTransport is kept unchanged apart from its fork marker.",
+        "The Config struct stays field-for-field identical to net/http.HTTP2Config; the fork converts between them in transportConfig.HTTP2Config."
+      ],
+      "verify": ["scripts/verify.sh", "scripts/minimal-diff-check.sh"]
+    },
+    {
+      "id": "site-httpcommon-drop-server-api",
+      "layer": "L2",
+      "kind": "delete-symbol",
+      "summary": "Server-side request decoding is dropped from the copied httpcommon package.",
+      "targets": [
+        {
+          "file": "http2/internal/httpcommon/httpcommon.go",
+          "symbol": "ServerRequestParam, ServerRequestResult, NewServerRequest"
+        }
+      ],
+      "anchors": [
+        "Symbols at the end of the upstream file used only by server.go."
+      ],
+      "invariants": [
+        "Removing them keeps the package compiling without the server files.",
+        "Nothing in the vendored client subset references these symbols."
+      ],
+      "verify": ["scripts/verify.sh", "scripts/httpcommon-diff.sh"]
+    },
+    {
+      "id": "site-transport-opt-field",
+      "layer": "L1",
+      "kind": "new-file",
+      "summary": "Transport carries the fork's Options, and Options carries the uTLS config and the dialer.",
+      "targets": [
+        {
+          "file": "http2/transport.go",
+          "symbol": "Transport.opt"
+        },
+        {
+          "file": "http2/patch.go",
+          "symbol": "Options"
+        }
+      ],
+      "anchors": [
+        "The Transport struct, which upstream declares as t1 plus connPool plus transportTestHooks.",
+        "Options with HeaderOrder, PHeaderOrder, Settings, WindowSizeIncrement, PriorityParams, GetTlsClientHelloSpec, TLSClientConfig."
+      ],
+      "invariants": [
+        "Transport.opt is read by newClientConn, by the header-writing path and by dialTLSWithContext.",
+        "Options.TLSClientConfig holds the uTLS config because the vendored Transport has no TLS fields of its own.",
+        "Options.dialContext is unexported: configureTransports fills it from the net/http Transport."
+      ],
+      "verify": ["scripts/verify.sh"]
+    },
+    {
+      "id": "site-transport-config-adapter",
+      "layer": "L1",
+      "kind": "new-file",
+      "summary": "transportConfig adapts the net/http Transport to the vendored TransportConfig interface.",
+      "targets": [
+        {
+          "file": "http2/patch.go",
+          "symbol": "transportConfig"
+        }
+      ],
+      "anchors": [
+        "The vendored TransportConfig interface: MaxHeaderListSize, MaxResponseHeaderBytes, DisableCompression, DisableKeepAlives, ExpectContinueTimeout, ResponseHeaderTimeout, IdleConnTimeout, HTTP2Config.",
+        "net/http's own transportConfig in src/net/http/http2.go, which merges http.Transport fields the same way."
+      ],
+      "invariants": [
+        "Every method delegates to the http.Transport the fork is installed on, so caller settings keep working.",
+        "HTTP2Config converts http.HTTP2Config to Config directly: upstream keeps the two field-for-field identical.",
+        "MaxHeaderListSize returns zero because net/http has no such field; the limit comes from MaxResponseHeaderBytes."
+      ],
+      "verify": ["scripts/verify.sh"]
+    },
+    {
+      "id": "site-http-request-adapter",
+      "layer": "L1",
+      "kind": "new-file",
+      "summary": "The fork translates between net/http and the vendored ClientRequest/ClientResponse types.",
+      "targets": [
+        {
+          "file": "http2/patch.go",
+          "symbol": "roundTripHTTP, clientRequestFromRequest, httpResponseFromClientResponse"
+        },
+        {
+          "file": "http2/patch.go",
+          "symbol": "noDialH2RoundTripper, errRoundTripper, registerHTTPSProtocol"
+        }
+      ],
+      "anchors": [
+        "The vendored ClientRequest and ClientResponse types, which exist so the standard library package does not import net/http.",
+        "net/http's own adapter in src/net/http/http2.go (http2RoundTrip), which the fork cannot import.",
+        "ErrNoCachedConn and isNoCachedConnError, which net/http maps to http.ErrSkipAltProtocol so it can fall back to its own dial path."
+      ],
+      "invariants": [
+        "roundTripHTTP keeps Request, TLS, Trailer, ContentLength and Uncompressed on the response.",
+        "noDialH2RoundTripper returns http.ErrSkipAltProtocol when no conn is cached, never an error.",
+        "registerHTTPSProtocol converts RegisterProtocol's panic into an error, as the old x/net transport did."
+      ],
+      "verify": ["scripts/verify.sh", "http2/patch_e2e_test.go"]
+    },
+    {
+      "id": "site-configure-transports",
+      "layer": "L1",
+      "kind": "new-file",
+      "summary": "ConfigureTransport and ConfigureTransports are fork-only: the standard library package has no net/http integration of its own.",
+      "targets": [
+        {
+          "file": "http2/patch.go",
+          "symbol": "ConfigureTransport, ConfigureTransports, configureTransports"
+        }
+      ],
+      "anchors": [
+        "The net/http Transport the caller passes in.",
+        "NewTransport(transportConfig{...}), which builds the vendored Transport together with its connection pool."
+      ],
+      "invariants": [
+        "The exported signature takes variadic Options: ConfigureTransport(t1 *http.Transport, opt ...Options) error.",
+        "The fork transport is built through NewTransport so the connection pool is never nil.",
+        "t1.DialTLSContext is set so every h2 dial goes through uTLS rather than net/http's own TLS.",
+        "Both TLSNextProto entries, h2 and unencrypted_http2, route through upgradeFn.",
+        "The https alt protocol is registered so net/http hands h2 requests to the fork."
+      ],
+      "verify": ["scripts/verify.sh", "http2/patch_e2e_test.go"]
+    },
+    {
+      "id": "site-dial-tls-with-context",
+      "layer": "L1",
+      "kind": "replace-symbol",
+      "summary": "dialTLSWithContext is rewritten to handshake through uTLS.",
+      "targets": [
+        {
+          "file": "http2/transport.go",
+          "symbol": "(*Transport).dialTLSWithContext",
+          "change": "rewritten in place"
+        }
+      ],
+      "anchors": [
+        "The vendored method that wraps tls.Dialer{Config: cfg}.DialContext and returns cn.(*tls.Conn).",
+        "dialTLS immediately above it, which calls ConnectionState() on the result and checks NegotiatedProtocol."
+      ],
+      "invariants": [
+        "The return type is *utls.UConn, which satisfies the dialTLS caller's use of ConnectionState().",
+        "The uTLS handshake runs on the conn from Options.dialContext, so the caller's dialer and timeouts still apply.",
+        "Options.GetTlsClientHelloSpec nil means HelloGolang; otherwise HelloCustom plus ApplyPreset.",
+        "A failed handshake closes the underlying conn."
+      ],
+      "verify": ["scripts/verify.sh", "http2/patch_fingerprint_test.go"]
+    },
+    {
+      "id": "site-new-client-conn",
+      "layer": "L1",
+      "kind": "replace-symbol",
+      "summary": "newClientConn takes SETTINGS, the connection WINDOW_UPDATE and PRIORITY frames from Options.",
+      "targets": [
+        {
+          "file": "http2/transport.go",
+          "symbol": "(*Transport).newClientConn",
+          "change": "rewritten in place"
+        }
+      ],
+      "anchors": [
+        "The vendored method building a ClientConn, writing clientPreface and then WriteSettings of a slice derived from the TransportConfig.",
+        "The connectionStater branch that stores cc.tlsState."
+      ],
+      "invariants": [
+        "Every SETTINGS id/val pair from Options.Settings reaches the wire in the caller's order.",
+        "Options.WindowSizeIncrement replaces the TransportConfig value as the connection WINDOW_UPDATE when non-zero.",
+        "Each Options.PriorityParams entry becomes one PRIORITY frame.",
+        "A negotiated protocol other than NextProtoTLS returns the ClientConn instead of failing.",
+        "cc.tlsState stays nil: net/http holds the forged conn, not the uTLS one."
+      ],
+      "verify": ["scripts/verify.sh", "http2/patch_fingerprint_test.go"]
+    },
+    {
+      "id": "site-header-order-plumbing",
+      "layer": "L1",
+      "kind": "call-site-inline",
+      "summary": "encodeRequestHeaders carries Options so header order reaches the encoder.",
+      "targets": [
+        {
+          "file": "http2/transport.go",
+          "symbol": "encodeRequestHeaders and its call site",
+          "change": "signature extended"
+        }
+      ],
+      "anchors": [
+        "The helper that builds EncodeHeadersParam from a ClientRequest.",
+        "Its single caller in writeRequest, which passes cs.requestedGzip and cc.peerMaxHeaderListSize."
+      ],
+      "invariants": [
+        "The call site passes cc.t.opt.",
+        "EncodeHeadersParam keeps AddGzipHeader, PeerMaxHeaderListSize and DefaultUserAgent unchanged and adds HeaderOrder and PHeaderOrder."
+      ],
+      "verify": ["scripts/verify.sh", "http2/patch_fingerprint_test.go"]
+    },
+    {
+      "id": "site-httpcommon-header-order",
+      "layer": "L1",
+      "kind": "new-file",
+      "summary": "httpcommon learns caller-controlled header order.",
+      "targets": [
+        {
+          "file": "http2/internal/httpcommon/httpcommon.go",
+          "symbol": "EncodeHeadersParam.HeaderOrder, EncodeHeadersParam.PHeaderOrder, enumerateHeaders",
+          "change": "rewritten in place"
+        },
+        {
+          "file": "http2/internal/httpcommon/sorts.go",
+          "symbol": "headerSorter, sortedKeyValues, sortedKeyValuesBy",
+          "change": "fork-owned new file"
+        }
+      ],
+      "anchors": [
+        "Pseudo-header emission that upstream writes as :authority, :method, :path, :scheme in a fixed order.",
+        "Loop over req.Header that upstream writes as \"for k, vv := range req.Header\"."
+      ],
+      "invariants": [
+        "With PHeaderOrder set, pseudo headers are emitted in exactly that order; unset reproduces upstream order.",
+        "With HeaderOrder set, listed headers come first in listed order and unlisted ones follow lexicographically.",
+        "Name lookups are case-insensitive: the sorter compares strings.ToLower(key) against HeaderOrder entries.",
+        "Header names are still lowercased by LowerHeader before they reach the wire.",
+        "The fork adds the net/http import that http.MethodGet needs."
+      ],
+      "verify": ["http2/patch_fingerprint_test.go", "scripts/httpcommon-diff.sh"]
+    },
+    {
+      "id": "site-hack-tls-conn",
+      "layer": "L1",
+      "kind": "new-file",
+      "summary": "hackTlsConn forges a crypto/tls.Conn wrapping the uTLS conn so net/http's TLSNextProto path accepts it.",
+      "targets": [
+        {
+          "file": "http2/patch.go",
+          "symbol": "hackTlsConn, hackField, init"
+        }
+      ],
+      "anchors": [
+        "reflect.TypeOf(new(cryptotls.Conn)).Elem() field offsets collected for conn, config, clientProtocol and isHandshakeComplete.",
+        "unsafe.Pointer arithmetic writing those private fields on a freshly allocated crypto/tls.Conn."
+      ],
+      "invariants": [
+        "A field name that disappears or changes type makes this site BROKEN, never silently skipped: the offsets are what make net/http hand the conn to the h2 RoundTripper.",
+        "Only conns whose negotiated protocol is NextProtoTLS are wrapped; anything else is returned unchanged.",
+        "isHandshakeComplete is set through Store, not by assigning a sync/atomic.Bool value, so go vet stays clean.",
+        "This site disappears only if the fork stops using TLSNextProto and owns the https path itself."
+      ],
+      "verify": ["http2/patch_fingerprint_test.go"]
+    },
+    {
+      "id": "site-unencrypted-net-conn",
+      "layer": "L1",
+      "kind": "new-file",
+      "summary": "The unencrypted-h2 handoff unwraps net/http's TLSNextProto conn.",
+      "targets": [
+        {
+          "file": "http2/patch.go",
+          "symbol": "unencryptedNetConnFromTLSConn"
+        }
+      ],
+      "anchors": [
+        "net/http wraps a cleartext conn in a *tls.Conn implementing UnencryptedNetConn() net.Conn before calling TLSNextProto[\"unencrypted_http2\"].",
+        "The x/net implementation of the same helper, which the standard library package does not carry."
+      ],
+      "invariants": [
+        "The parameter type is net.Conn, not *crypto/tls.Conn.",
+        "A conn without UnencryptedNetConn is an error, not a silent fallback."
+      ],
+      "verify": ["scripts/verify.sh"]
+    },
+    {
+      "id": "site-replaced-function-convention",
+      "layer": "L3",
+      "kind": "delete-symbol",
+      "meta": true,
+      "summary": "Every edit to an upstream-owned file is marked with a // fork: comment naming its site.",
+      "targets": [
+        {
+          "file": "http2/transport.go",
+          "symbol": "every site declared with change: rewritten in place"
+        },
+        {
+          "file": "http2/api.go",
+          "symbol": "every site declared with an upstream-owned target"
+        }
+      ],
+      "anchors": [
+        "A comment of the form \"// fork: <site-id>\" immediately above the edit."
+      ],
+      "invariants": [
+        "No large commented-out upstream function body exists anywhere in http2/.",
+        "scripts/minimal-diff-check.sh fails when an upstream-owned site has no marker."
+      ],
+      "verify": ["scripts/minimal-diff-check.sh"]
+    },
+    {
+      "id": "site-offline-fingerprint-test",
+      "layer": "L1",
+      "kind": "new-file",
+      "summary": "The golden fingerprint and the net/http wiring are pinned offline.",
+      "targets": [
+        {
+          "file": "http2/patch_fingerprint_test.go",
+          "symbol": "TestGoldenHeaderOrder, TestGoldenHeaderOrderDefault, TestGoldenClientPrefaceFrames, TestHackTlsConn"
+        },
+        {
+          "file": "http2/patch_e2e_test.go",
+          "symbol": "TestEndToEndOverPipe"
+        }
+      ],
+      "anchors": [
+        "goldenAkamaiFingerprint constant that mirrors the live assertion in patch_test.go.",
+        "The profile in the tests, settings and window increment and header order, must stay identical to the profile in patch_test.go.",
+        "TestEndToEndOverPipe serves one request over net.Pipe with a hand written responder; net.Pipe has no buffer, so the responder must keep reading while a separate goroutine writes."
+      ],
+      "invariants": [
+        "The tests never open a network connection.",
+        "The golden string equals SETTINGS|WINDOW_UPDATE|priority|pseudo-header codes.",
+        "When the live profile changes, the tests change together.",
+        "TestHackTlsConn drives a real uTLS handshake over net.Pipe against a crypto/tls server, so a Go release that renames the unexported crypto/tls.Conn fields fails offline.",
+        "TestEndToEndOverPipe asserts the 200 response plus the SETTINGS and header order seen on the wire, which proves net/http routes to TLSNextProto[\"h2\"] rather than its bundled HTTP/2."
+      ],
+      "verify": ["go test ./http2/ -count=1"]
+    }
+  ]
+}

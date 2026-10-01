@@ -1,0 +1,3 @@
+interface:
+  display_name: "HTTP/2 Repatch"
+  short_description: "Re-apply the uTLS patch after re-basing the vendored x/net/http2 copy"

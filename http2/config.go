@@ -9,57 +9,27 @@ import (
 	"time"
 )
 
-// http2Config is a package-internal version of net/http.HTTP2Config.
-//
-// http.HTTP2Config was added in Go 1.24.
-// When running with a version of net/http that includes HTTP2Config,
-// we merge the configuration with the fields in Transport or Server
-// to produce an http2Config.
-//
-// Zero valued fields in http2Config are interpreted as in the
-// net/http.HTTPConfig documentation.
-//
-// Precedence order for reconciling configurations is:
-//
-//   - Use the net/http.{Server,Transport}.HTTP2Config value, when non-zero.
-//   - Otherwise use the http2.{Server.Transport} value.
-//   - If the resulting value is zero or out of range, use a default.
-type http2Config struct {
-	MaxConcurrentStreams         uint32
-	MaxDecoderHeaderTableSize    uint32
-	MaxEncoderHeaderTableSize    uint32
-	MaxReadFrameSize             uint32
-	MaxUploadBufferPerConnection int32
-	MaxUploadBufferPerStream     int32
-	SendPingTimeout              time.Duration
-	PingTimeout                  time.Duration
-	WriteByteTimeout             time.Duration
-	PermitProhibitedCipherSuites bool
-	CountError                   func(errType string)
+// Config must be kept in sync with net/http.HTTP2Config.
+type Config struct {
+	MaxConcurrentStreams          int
+	StrictMaxConcurrentRequests   bool
+	MaxDecoderHeaderTableSize     int
+	MaxEncoderHeaderTableSize     int
+	MaxReadFrameSize              int
+	MaxReceiveBufferPerConnection int
+	MaxReceiveBufferPerStream     int
+	SendPingTimeout               time.Duration
+	PingTimeout                   time.Duration
+	WriteByteTimeout              time.Duration
+	PermitProhibitedCipherSuites  bool
+	CountError                    func(errType string)
 }
 
-// configFromTransport merges configuration settings from h2 and h2.t1.HTTP2
-// (the net/http Transport).
-func configFromTransport(h2 *Transport) http2Config {
-	conf := http2Config{
-		MaxEncoderHeaderTableSize: h2.MaxEncoderHeaderTableSize,
-		MaxDecoderHeaderTableSize: h2.MaxDecoderHeaderTableSize,
-		MaxReadFrameSize:          h2.MaxReadFrameSize,
-		SendPingTimeout:           h2.ReadIdleTimeout,
-		PingTimeout:               h2.PingTimeout,
-		WriteByteTimeout:          h2.WriteByteTimeout,
-	}
-
-	// Unlike most config fields, where out-of-range values revert to the default,
-	// Transport.MaxReadFrameSize clips.
-	if conf.MaxReadFrameSize < minMaxFrameSize {
-		conf.MaxReadFrameSize = minMaxFrameSize
-	} else if conf.MaxReadFrameSize > maxFrameSize {
-		conf.MaxReadFrameSize = maxFrameSize
-	}
-
+// fork: site-config-drop-server. configFromServer was dropped with server.go.
+func configFromTransport(h2 *Transport) Config {
+	conf := Config{}
 	if h2.t1 != nil {
-		fillNetHTTPTransportConfig(&conf, h2.t1)
+		fillNetHTTPConfig(&conf, h2.t1.HTTP2Config())
 	}
 	setConfigDefaults(&conf, false)
 	return conf
@@ -71,19 +41,19 @@ func setDefault[T ~int | ~int32 | ~uint32 | ~int64](v *T, minval, maxval, defval
 	}
 }
 
-func setConfigDefaults(conf *http2Config, server bool) {
-	setDefault(&conf.MaxConcurrentStreams, 1, math.MaxUint32, defaultMaxStreams)
-	setDefault(&conf.MaxEncoderHeaderTableSize, 1, math.MaxUint32, initialHeaderTableSize)
-	setDefault(&conf.MaxDecoderHeaderTableSize, 1, math.MaxUint32, initialHeaderTableSize)
+func setConfigDefaults(conf *Config, server bool) {
+	setDefault(&conf.MaxConcurrentStreams, 1, math.MaxInt32, defaultMaxStreams)
+	setDefault(&conf.MaxEncoderHeaderTableSize, 1, math.MaxInt32, initialHeaderTableSize)
+	setDefault(&conf.MaxDecoderHeaderTableSize, 1, math.MaxInt32, initialHeaderTableSize)
 	if server {
-		setDefault(&conf.MaxUploadBufferPerConnection, initialWindowSize, math.MaxInt32, 1<<20)
+		setDefault(&conf.MaxReceiveBufferPerConnection, initialWindowSize, math.MaxInt32, 1<<20)
 	} else {
-		setDefault(&conf.MaxUploadBufferPerConnection, initialWindowSize, math.MaxInt32, transportDefaultConnFlow)
+		setDefault(&conf.MaxReceiveBufferPerConnection, initialWindowSize, math.MaxInt32, transportDefaultConnFlow)
 	}
 	if server {
-		setDefault(&conf.MaxUploadBufferPerStream, 1, math.MaxInt32, 1<<20)
+		setDefault(&conf.MaxReceiveBufferPerStream, 1, math.MaxInt32, 1<<20)
 	} else {
-		setDefault(&conf.MaxUploadBufferPerStream, 1, math.MaxInt32, transportDefaultStreamFlow)
+		setDefault(&conf.MaxReceiveBufferPerStream, 1, math.MaxInt32, transportDefaultStreamFlow)
 	}
 	setDefault(&conf.MaxReadFrameSize, minMaxFrameSize, maxFrameSize, defaultMaxReadFrameSize)
 	setDefault(&conf.PingTimeout, 1, math.MaxInt64, 15*time.Second)
@@ -97,4 +67,46 @@ func adjustHTTP1MaxHeaderSize(n int64) int64 {
 	const perFieldOverhead = 32 // per http2 spec
 	const typicalHeaders = 10   // conservative
 	return n + typicalHeaders*perFieldOverhead
+}
+
+func fillNetHTTPConfig(conf *Config, h2 Config) {
+	if h2.MaxConcurrentStreams != 0 {
+		conf.MaxConcurrentStreams = h2.MaxConcurrentStreams
+	}
+	if h2.StrictMaxConcurrentRequests {
+		conf.StrictMaxConcurrentRequests = true
+	}
+	if h2.MaxEncoderHeaderTableSize != 0 {
+		conf.MaxEncoderHeaderTableSize = h2.MaxEncoderHeaderTableSize
+	}
+	if h2.MaxDecoderHeaderTableSize != 0 {
+		conf.MaxDecoderHeaderTableSize = h2.MaxDecoderHeaderTableSize
+	}
+	if h2.MaxConcurrentStreams != 0 {
+		conf.MaxConcurrentStreams = h2.MaxConcurrentStreams
+	}
+	if h2.MaxReadFrameSize != 0 {
+		conf.MaxReadFrameSize = h2.MaxReadFrameSize
+	}
+	if h2.MaxReceiveBufferPerConnection != 0 {
+		conf.MaxReceiveBufferPerConnection = h2.MaxReceiveBufferPerConnection
+	}
+	if h2.MaxReceiveBufferPerStream != 0 {
+		conf.MaxReceiveBufferPerStream = h2.MaxReceiveBufferPerStream
+	}
+	if h2.SendPingTimeout != 0 {
+		conf.SendPingTimeout = h2.SendPingTimeout
+	}
+	if h2.PingTimeout != 0 {
+		conf.PingTimeout = h2.PingTimeout
+	}
+	if h2.WriteByteTimeout != 0 {
+		conf.WriteByteTimeout = h2.WriteByteTimeout
+	}
+	if h2.PermitProhibitedCipherSuites {
+		conf.PermitProhibitedCipherSuites = true
+	}
+	if h2.CountError != nil {
+		conf.CountError = h2.CountError
+	}
 }

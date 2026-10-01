@@ -1,31 +1,40 @@
+// This file is the fork's own code: it is not copied from the Go standard library.
+// It holds the fingerprint options, the net/http integration, and the replacements for
+// the vendored client functions the fork has to change.
+//
+// Maintenance rules: .agents/skills/http2-repatch/references/patch-manifest.json
+
 package http2
 
 import (
-	"bufio"
 	"context"
 	cryptotls "crypto/tls"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/textproto"
 	"reflect"
+	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	tls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2/hpack"
 )
 
 const (
 	defaultMaxStreams = 250 // TODO: make this 100 as the GFE seems to?
+
+	// nextProtoUnencryptedHTTP2 is the TLSNextProto key net/http uses to hand a
+	// cleartext HTTP/2 connection to an external implementation.
+	nextProtoUnencryptedHTTP2 = "unencrypted_http2"
 )
 
 var hackField = map[string]uintptr{}
-var done = atomic.Bool{}
 
 func init() {
-	done.Store(true)
 	t := reflect.TypeOf(new(cryptotls.Conn)).Elem()
 	for _, name := range []string{"conn", "config", "clientProtocol", "isHandshakeComplete"} {
 		field, ok := t.FieldByName(name)
@@ -35,7 +44,18 @@ func init() {
 	}
 }
 
-// hackTlsConn make a hack, set private field
+// hackTlsConn forges a *crypto/tls.Conn whose private fields point at the uTLS connection.
+//
+// net/http performs its own TLS handshake and then hands the result to the registered
+// TLSNextProto["h2"] callback as a *crypto/tls.Conn. Because the fork wants that handshake
+// to be a uTLS one, it dials through Transport.DialTLSContext and then has to hand
+// net/http something it accepts. The forged value is only an envelope: net/http inspects
+// clientProtocol for ALPN and then calls NetConn(), which returns the uTLS conn stored in
+// the conn field.
+//
+// The field names and their layout are unexported details of the standard library. If any
+// of them disappears or changes type, this site is BROKEN rather than something to work
+// around with a different cast.
 func hackTlsConn(uConn *tls.UConn) net.Conn {
 	state := uConn.ConnectionState()
 	if state.NegotiatedProtocol != NextProtoTLS {
@@ -44,16 +64,16 @@ func hackTlsConn(uConn *tls.UConn) net.Conn {
 	ret := new(cryptotls.Conn)
 
 	for field, offset := range hackField {
-		ptr := unsafe.Pointer(uintptr(unsafe.Pointer(ret)) + offset)
+		ptr := unsafe.Add(unsafe.Pointer(ret), offset)
 		switch field {
 		case "conn":
 			*(*net.Conn)(ptr) = uConn
 		case "config":
-			*(**cryptotls.Config)(ptr) = &cryptotls.Config{}
+			*(**cryptotls.Config)(ptr) = new(cryptotls.Config)
 		case "clientProtocol":
 			*(*string)(ptr) = state.NegotiatedProtocol
 		case "isHandshakeComplete":
-			*(*atomic.Bool)(ptr) = done
+			(*atomic.Bool)(ptr).Store(true)
 		}
 	}
 	return ret
@@ -95,6 +115,80 @@ type Options struct {
 	// tls.UClient.
 	// If nil, the default configuration is used.
 	GetTlsClientHelloSpec func() *tls.ClientHelloSpec
+
+	// TLSClientConfig is the uTLS configuration used for the handshake. The vendored
+	// transport has no TLS config of its own, so the fork carries it here.
+	TLSClientConfig *tls.Config
+
+	// dialContext opens the plain TCP connection that the uTLS handshake runs on.
+	// It is filled in from the net/http Transport and is not user configurable.
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// transportConfig adapts the net/http Transport the fork is installed on to the vendored
+// client's TransportConfig interface.
+type transportConfig struct {
+	t1 *http.Transport
+}
+
+func (c transportConfig) MaxHeaderListSize() int64 {
+	// net/http has no equivalent of the old x/net MaxHeaderListSize; the header list
+	// limit comes from MaxResponseHeaderBytes below.
+	return 0
+}
+
+func (c transportConfig) MaxResponseHeaderBytes() int64 {
+	if c.t1 == nil {
+		return 0
+	}
+	return c.t1.MaxResponseHeaderBytes
+}
+
+func (c transportConfig) DisableCompression() bool {
+	return c.t1 == nil || c.t1.DisableCompression
+}
+
+func (c transportConfig) DisableKeepAlives() bool {
+	return c.t1 != nil && c.t1.DisableKeepAlives
+}
+
+func (c transportConfig) ExpectContinueTimeout() time.Duration {
+	if c.t1 == nil {
+		return 0
+	}
+	return c.t1.ExpectContinueTimeout
+}
+
+func (c transportConfig) ResponseHeaderTimeout() time.Duration {
+	if c.t1 == nil {
+		return 0
+	}
+	return c.t1.ResponseHeaderTimeout
+}
+
+func (c transportConfig) IdleConnTimeout() time.Duration {
+	if c.t1 == nil {
+		return 0
+	}
+	return c.t1.IdleConnTimeout
+}
+
+// HTTP2Config reports the HTTP/2 settings the caller put on the net/http Transport.
+// Config and http.HTTP2Config are kept field-for-field identical upstream.
+func (c transportConfig) HTTP2Config() Config {
+	if c.t1 == nil || c.t1.HTTP2 == nil {
+		return Config{}
+	}
+	return Config(*c.t1.HTTP2)
+}
+
+var zeroDialer net.Dialer
+
+func dialContextFrom(t1 *http.Transport) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	if t1 != nil && t1.DialContext != nil {
+		return t1.DialContext
+	}
+	return zeroDialer.DialContext
 }
 
 // ConfigureTransport configures a net/http HTTP/1 Transport to use HTTP/2.
@@ -114,16 +208,15 @@ func ConfigureTransports(t1 *http.Transport, opt ...Options) (*Transport, error)
 }
 
 func configureTransports(t1 *http.Transport, opt ...Options) (*Transport, error) {
-	connPool := new(clientConnPool)
-	t2 := &Transport{
-		AllowHTTP: true,
-		ConnPool:  noDialClientConnPool{connPool},
-		t1:        t1,
-	}
+	t2 := NewTransport(transportConfig{t1: t1})
 	if len(opt) > 0 {
 		t2.opt = opt[0]
 	}
-	connPool.t = t2
+	if t2.opt.dialContext == nil {
+		t2.opt.dialContext = dialContextFrom(t1)
+	}
+
+	// Every h2 dial goes through uTLS: net/http must not run its own handshake.
 	t1.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -133,26 +226,26 @@ func configureTransports(t1 *http.Transport, opt ...Options) (*Transport, error)
 		if err != nil {
 			return nil, err
 		}
-		// set the utls.Conn to cryptotls.NetConn
+		// Hand net/http the forged crypto/tls.Conn that wraps the uTLS conn.
 		return hackTlsConn(conn), nil
 	}
-	if err := registerHTTPSProtocol(t1, noDialH2RoundTripper{t2}); err != nil {
+	if err := registerHTTPSProtocol(t1, noDialH2RoundTripper{t: t2}); err != nil {
 		return nil, err
 	}
 	if t1.TLSClientConfig == nil {
 		t1.TLSClientConfig = new(cryptotls.Config)
 	}
-	if !strSliceContains(t1.TLSClientConfig.NextProtos, "h2") {
+	if !slices.Contains(t1.TLSClientConfig.NextProtos, "h2") {
 		t1.TLSClientConfig.NextProtos = append([]string{"h2"}, t1.TLSClientConfig.NextProtos...)
 	}
-	if !strSliceContains(t1.TLSClientConfig.NextProtos, "http/1.1") {
+	if !slices.Contains(t1.TLSClientConfig.NextProtos, "http/1.1") {
 		t1.TLSClientConfig.NextProtos = append(t1.TLSClientConfig.NextProtos, "http/1.1")
 	}
 	upgradeFn := func(scheme, authority string, c net.Conn) http.RoundTripper {
 		addr := authorityAddr(scheme, authority)
-		if used, err := connPool.addConnIfNeeded(addr, t2, c); err != nil {
+		if used, err := t2.connPool.addConnIfNeeded(addr, t2, c); err != nil {
 			go c.Close()
-			return erringRoundTripper{err}
+			return errRoundTripper{err}
 		} else if !used {
 			// Turns out we don't need this c.
 			// For example, two goroutines made requests to the same host
@@ -160,209 +253,93 @@ func configureTransports(t1 *http.Transport, opt ...Options) (*Transport, error)
 			// was unknown)
 			go c.Close()
 		}
-		if scheme == "http" {
-			return (*unencryptedTransport)(t2)
-		}
-		return t2
+		return noDialH2RoundTripper{t: t2}
 	}
 	if t1.TLSNextProto == nil {
 		t1.TLSNextProto = make(map[string]func(string, *cryptotls.Conn) http.RoundTripper)
 	}
 	t1.TLSNextProto[NextProtoTLS] = func(authority string, c *cryptotls.Conn) http.RoundTripper {
-		// get the utls.Conn
+		// get the uTLS conn back out of the forged crypto/tls.Conn
 		return upgradeFn("https", authority, c.NetConn())
 	}
 	// The "unencrypted_http2" TLSNextProto key is used to pass off non-TLS HTTP/2 conns.
 	t1.TLSNextProto[nextProtoUnencryptedHTTP2] = func(authority string, c *cryptotls.Conn) http.RoundTripper {
-		nc, err := unencryptedNetConnFromTLSConn(c.NetConn())
-		if err != nil {
-			go c.Close()
-			return erringRoundTripper{err}
-		}
-		return upgradeFn("http", authority, nc)
+		return upgradeFn("http", authority, c.NetConn())
 	}
 	return t2, nil
 }
 
-var zeroDialer net.Dialer
-
-// dialTLSWithContext uses tls.Dialer, added in Go 1.15, to open a TLS
-// connection.
-func (t *Transport) dialTLSWithContext(ctx context.Context, network, addr string, cfg *tls.Config) (tlsConn *tls.UConn, err error) {
-	var conn net.Conn
-	if t.t1 != nil && t.t1.DialContext != nil {
-		conn, err = t.t1.DialContext(ctx, network, addr)
-	} else {
-		conn, err = zeroDialer.DialContext(ctx, network, addr)
-	}
-
-	if err != nil {
-		return
-	}
-
-	if t.opt.GetTlsClientHelloSpec != nil {
-		tlsConn = tls.UClient(conn, cfg, tls.HelloCustom)
-		if err = tlsConn.ApplyPreset(t.opt.GetTlsClientHelloSpec()); err != nil {
-			go conn.Close()
-			return
+// registerHTTPSProtocol calls Transport.RegisterProtocol, which panics on a duplicate
+// registration, and reports that as an error.
+func registerHTTPSProtocol(t *http.Transport, rt http.RoundTripper) (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = fmt.Errorf("%v", e)
 		}
-	} else {
-		tlsConn = tls.UClient(conn, cfg, tls.HelloGolang)
-	}
-
-	if err = tlsConn.HandshakeContext(ctx); err != nil {
-		go conn.Close()
-		return
-	}
-	return
+	}()
+	t.RegisterProtocol("https", rt)
+	return nil
 }
 
-func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, error) {
-	conf := configFromTransport(t)
-	cc := &ClientConn{
-		t:                           t,
-		tconn:                       c,
-		readerDone:                  make(chan struct{}),
-		nextStreamID:                1,
-		maxFrameSize:                16 << 10, // spec default
-		initialWindowSize:           65535,    // spec default
-		initialStreamRecvWindowSize: conf.MaxUploadBufferPerStream,
-		maxConcurrentStreams:        initialMaxConcurrentStreams, // "infinite", per spec. Use a smaller value until we have received server settings.
-		peerMaxHeaderListSize:       0xffffffffffffffff,          // "infinite", per spec. Use 2^64-1 instead.
-		streams:                     make(map[uint32]*clientStream),
-		singleUse:                   singleUse,
-		seenSettingsChan:            make(chan struct{}),
-		wantSettingsAck:             true,
-		readIdleTimeout:             conf.SendPingTimeout,
-		pingTimeout:                 conf.PingTimeout,
-		pings:                       make(map[[8]byte]chan struct{}),
-		reqHeaderMu:                 make(chan struct{}, 1),
-		lastActive:                  t.now(),
+// noDialH2RoundTripper implements http.RoundTripper by handing the request to the vendored
+// client. It never dials: net/http dials and pushes the connection into the pool.
+type noDialH2RoundTripper struct {
+	t *Transport
+}
+
+func (rt noDialH2RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	res, err := rt.t.roundTripHTTP(req)
+	if err == errClientConnUnusable || err == errClientConnGotGoAway || isNoCachedConnError(err) {
+		return nil, http.ErrSkipAltProtocol
 	}
+	return res, err
+}
 
-	// Start the idle timer after the connection is fully initialized.
-	if d := t.idleConnTimeout(); d != 0 {
-		cc.idleTimeout = d
-		cc.idleTimer = t.afterFunc(d, cc.onIdleTimeout)
+type errRoundTripper struct{ err error }
+
+func (rt errRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return nil, rt.err }
+func (rt errRoundTripper) RoundTripErr() error                             { return rt.err }
+
+// roundTripHTTP runs one *http.Request through the vendored client, which speaks its own
+// ClientRequest/ClientResponse types to stay independent of net/http.
+func (t *Transport) roundTripHTTP(req *http.Request) (*http.Response, error) {
+	res, err := t.RoundTripOpt(clientRequestFromRequest(req), RoundTripOpt{})
+	if err != nil {
+		return nil, err
 	}
+	return httpResponseFromClientResponse(req, res), nil
+}
 
-	var group synctestGroupInterface
-	if t.transportTestHooks != nil {
-		t.markNewGoroutine()
-		t.transportTestHooks.newclientconn(cc)
-		c = cc.tconn
-		group = t.group
+func clientRequestFromRequest(req *http.Request) *ClientRequest {
+	return &ClientRequest{
+		Context:       req.Context(),
+		Method:        req.Method,
+		URL:           req.URL,
+		Header:        Header(req.Header),
+		Trailer:       Header(req.Trailer),
+		Body:          req.Body,
+		Host:          req.Host,
+		GetBody:       req.GetBody,
+		ContentLength: req.ContentLength,
+		Close:         req.Close,
 	}
+}
 
-	cc.cond = sync.NewCond(&cc.mu)
-	cc.flow.add(int32(initialWindowSize))
-
-	// TODO: adjust this writer size to account for frame size +
-	// MTU + crypto/tls record padding.
-	cc.bw = bufio.NewWriter(stickyErrWriter{
-		group:   group,
-		conn:    c,
-		timeout: conf.WriteByteTimeout,
-		err:     &cc.werr,
-	})
-	cc.br = bufio.NewReader(c)
-	cc.fr = NewFramer(cc.bw, cc.br)
-	cc.fr.SetMaxReadFrameSize(conf.MaxReadFrameSize)
-	if t.CountError != nil {
-		cc.fr.countError = t.CountError
+func httpResponseFromClientResponse(req *http.Request, res *ClientResponse) *http.Response {
+	return &http.Response{
+		Status:        res.Status,
+		StatusCode:    res.StatusCode,
+		Proto:         "HTTP/2.0",
+		ProtoMajor:    2,
+		ProtoMinor:    0,
+		Header:        http.Header(res.Header),
+		Trailer:       http.Header(res.Trailer),
+		Body:          res.Body,
+		ContentLength: res.ContentLength,
+		Uncompressed:  res.Uncompressed,
+		Request:       req,
+		TLS:           res.TLS,
 	}
-
-	if t.AllowHTTP {
-		cc.nextStreamID = 3
-	}
-
-	cc.henc = hpack.NewEncoder(&cc.hbuf)
-	cc.henc.SetMaxDynamicTableSizeLimit(conf.MaxEncoderHeaderTableSize)
-	cc.peerMaxHeaderTableSize = initialHeaderTableSize
-
-	if cs, ok := c.(connectionStater); ok {
-		state := cs.ConnectionState()
-		//cc.tlsState = state
-		// if not HTTP/2
-		if state.NegotiatedProtocol != NextProtoTLS {
-			return cc, nil
-		}
-	}
-
-	maxHeaderTableSize := conf.MaxDecoderHeaderTableSize
-	var settings []Setting
-	if len(t.opt.Settings) == 0 {
-		settings = []Setting{
-			{ID: SettingEnablePush, Val: 0},
-			{ID: SettingInitialWindowSize, Val: uint32(cc.initialStreamRecvWindowSize)},
-		}
-		settings = append(settings, Setting{ID: SettingMaxFrameSize, Val: conf.MaxReadFrameSize})
-		if max := t.maxHeaderListSize(); max != 0 {
-			settings = append(settings, Setting{ID: SettingMaxHeaderListSize, Val: max})
-		}
-		if maxHeaderTableSize != initialHeaderTableSize {
-			settings = append(settings, Setting{ID: SettingHeaderTableSize, Val: maxHeaderTableSize})
-		}
-	} else {
-		settings = t.opt.Settings
-		settingVal := make([]uint32, 7)
-		for _, setting := range settings {
-			if err := setting.Valid(); err != nil {
-				return nil, err
-			}
-			settingVal[setting.ID] = setting.Val
-		}
-		if v := settingVal[SettingHeaderTableSize]; v > 0 {
-			t.MaxEncoderHeaderTableSize = v
-			t.MaxDecoderHeaderTableSize = v
-			maxHeaderTableSize = v
-		}
-		if v := settingVal[SettingMaxConcurrentStreams]; v > 0 {
-			cc.maxConcurrentStreams = v
-		}
-		if v := settingVal[SettingInitialWindowSize]; v > 0 {
-			cc.initialWindowSize = v
-		}
-		if v := settingVal[SettingMaxFrameSize]; v > 0 {
-			t.MaxReadFrameSize = v
-			cc.maxFrameSize = v
-		}
-		if v := settingVal[SettingMaxHeaderListSize]; v > 0 {
-			t.MaxHeaderListSize = v
-		}
-	}
-
-	cc.fr.ReadMetaHeaders = hpack.NewDecoder(maxHeaderTableSize, nil)
-	cc.fr.MaxHeaderListSize = t.maxHeaderListSize()
-
-	cc.bw.Write(clientPreface)
-	cc.fr.WriteSettings(settings...)
-	if t.opt.WindowSizeIncrement > 0 {
-		cc.fr.WriteWindowUpdate(0, t.opt.WindowSizeIncrement)
-		cc.inflow.init(int32(t.opt.WindowSizeIncrement + initialWindowSize))
-	} else {
-		cc.fr.WriteWindowUpdate(0, transportDefaultConnFlow)
-		cc.inflow.init(transportDefaultConnFlow + initialWindowSize)
-	}
-	if len(t.opt.PriorityParams) > 0 {
-		for id, frame := range t.opt.PriorityParams {
-			cc.fr.WritePriority(id, frame)
-		}
-	}
-	cc.bw.Flush()
-	if cc.werr != nil {
-		cc.Close()
-		return nil, cc.werr
-	}
-
-	// Start the idle timer after the connection is fully initialized.
-	if d := t.idleConnTimeout(); d != 0 {
-		cc.idleTimeout = d
-		cc.idleTimer = t.afterFunc(d, cc.onIdleTimeout)
-	}
-
-	go cc.readLoop()
-	return cc, nil
 }
 
 // foreachHeaderElement splits v according to the "#rule" construction
@@ -382,3 +359,5 @@ func foreachHeaderElement(v string, fn func(string)) {
 		}
 	}
 }
+
+var _ = io.Discard

@@ -12,12 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var (
-	extNet = os.Getenv("EXTNET")
-)
-
 func TestFingerPrint(t *testing.T) {
-	if extNet == "" {
+	if os.Getenv("EXTNET") == "" {
 		t.Skip("skipping external network test")
 	}
 

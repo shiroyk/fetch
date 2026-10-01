@@ -10,32 +10,8 @@ import (
 	"context"
 	"errors"
 	"net"
-	"net/http"
+	"slices"
 	"sync"
-)
-
-// ClientConnPool manages a pool of HTTP/2 client connections.
-type ClientConnPool interface {
-	// GetClientConn returns a specific HTTP/2 connection (usually
-	// a TLS-TCP connection) to an HTTP/2 server. On success, the
-	// returned ClientConn accounts for the upcoming RoundTrip
-	// call, so the caller should not omit it. If the caller needs
-	// to, ClientConn.RoundTrip can be called with a bogus
-	// new(http.Request) to release the stream reservation.
-	GetClientConn(req *http.Request, addr string) (*ClientConn, error)
-	MarkDead(*ClientConn)
-}
-
-// clientConnPoolIdleCloser is the interface implemented by ClientConnPool
-// implementations which can close their idle connections.
-type clientConnPoolIdleCloser interface {
-	ClientConnPool
-	closeIdleConnections()
-}
-
-var (
-	_ clientConnPoolIdleCloser = (*clientConnPool)(nil)
-	_ clientConnPoolIdleCloser = noDialClientConnPool{}
 )
 
 // TODO: use singleflight for dialing and addConnCalls?
@@ -51,7 +27,7 @@ type clientConnPool struct {
 	addConnCalls map[string]*addConnCall // in-flight addConnIfNeeded calls
 }
 
-func (p *clientConnPool) GetClientConn(req *http.Request, addr string) (*ClientConn, error) {
+func (p *clientConnPool) GetClientConn(req *ClientRequest, addr string) (*ClientConn, error) {
 	return p.getClientConn(req, addr, dialOnMiss)
 }
 
@@ -60,13 +36,13 @@ const (
 	noDialOnMiss = false
 )
 
-func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMiss bool) (*ClientConn, error) {
+func (p *clientConnPool) getClientConn(req *ClientRequest, addr string, dialOnMiss bool) (*ClientConn, error) {
 	// TODO(dneil): Dial a new connection when t.DisableKeepAlives is set?
 	if isConnectionCloseRequest(req) && dialOnMiss {
 		// It gets its own connection.
 		traceGetConn(req, addr)
 		const singleUse = true
-		cc, err := p.t.dialClientConn(req.Context(), addr, singleUse)
+		cc, err := p.t.dialClientConn(req.Context, addr, singleUse)
 		if err != nil {
 			return nil, err
 		}
@@ -92,7 +68,7 @@ func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMis
 			return nil, ErrNoCachedConn
 		}
 		traceGetConn(req, addr)
-		call := p.getStartDialLocked(req.Context(), addr)
+		call := p.getStartDialLocked(req.Context, addr)
 		p.mu.Unlock()
 		<-call.done
 		if shouldRetryDial(call, req) {
@@ -195,7 +171,7 @@ type addConnCall struct {
 }
 
 func (c *addConnCall) run(t *Transport, key string, nc net.Conn) {
-	cc, err := t.NewClientConn(nc)
+	cc, err := t.newClientConn(nc, t.disableKeepAlives(), nil)
 
 	p := c.p
 	p.mu.Lock()
@@ -212,10 +188,8 @@ func (c *addConnCall) run(t *Transport, key string, nc net.Conn) {
 
 // p.mu must be held
 func (p *clientConnPool) addConnLocked(key string, cc *ClientConn) {
-	for _, v := range p.conns[key] {
-		if v == cc {
-			return
-		}
+	if slices.Contains(p.conns[key], cc) {
+		return
 	}
 	if p.conns == nil {
 		p.conns = make(map[string][]*ClientConn)
@@ -281,7 +255,7 @@ func filterOutClientConn(in []*ClientConn, exclude *ClientConn) []*ClientConn {
 // connection instead.
 type noDialClientConnPool struct{ *clientConnPool }
 
-func (p noDialClientConnPool) GetClientConn(req *http.Request, addr string) (*ClientConn, error) {
+func (p noDialClientConnPool) GetClientConn(req *ClientRequest, addr string) (*ClientConn, error) {
 	return p.getClientConn(req, addr, noDialOnMiss)
 }
 
@@ -289,12 +263,12 @@ func (p noDialClientConnPool) GetClientConn(req *http.Request, addr string) (*Cl
 // retry dialing after the call finished unsuccessfully, for example
 // if the dial was canceled because of a context cancellation or
 // deadline expiry.
-func shouldRetryDial(call *dialCall, req *http.Request) bool {
+func shouldRetryDial(call *dialCall, req *ClientRequest) bool {
 	if call.err == nil {
 		// No error, no need to retry
 		return false
 	}
-	if call.ctx == req.Context() {
+	if call.ctx == req.Context {
 		// If the call has the same context as the request, the dial
 		// should not be retried, since any cancellation will have come
 		// from this request.

@@ -11,20 +11,16 @@
 // requires Go 1.6 or later)
 //
 // See https://http2.github.io/ for more information on HTTP/2.
-//
-// See https://http2.golang.org/ for a test server running this code.
-package http2 // import "golang.org/x/net/http2"
+package http2
 
 import (
 	"bufio"
-	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,7 +33,6 @@ var (
 	VerboseLogs    bool
 	logFrameWrites bool
 	logFrameReads  bool
-	inTests        bool
 
 	// Enabling extended CONNECT by causes browsers to attempt to use
 	// WebSockets-over-HTTP/2. This results in problems when the server's websocket
@@ -47,6 +42,8 @@ var (
 	//
 	// Issue #71128.
 	disableExtendedConnectProtocol = true
+
+	inTests = false
 )
 
 func init() {
@@ -173,6 +170,7 @@ const (
 	SettingMaxFrameSize          SettingID = 0x5
 	SettingMaxHeaderListSize     SettingID = 0x6
 	SettingEnableConnectProtocol SettingID = 0x8
+	SettingNoRFC7540Priorities   SettingID = 0x9
 )
 
 var settingName = map[SettingID]string{
@@ -183,6 +181,7 @@ var settingName = map[SettingID]string{
 	SettingMaxFrameSize:          "MAX_FRAME_SIZE",
 	SettingMaxHeaderListSize:     "MAX_HEADER_LIST_SIZE",
 	SettingEnableConnectProtocol: "ENABLE_CONNECT_PROTOCOL",
+	SettingNoRFC7540Priorities:   "NO_RFC7540_PRIORITIES",
 }
 
 func (s SettingID) String() string {
@@ -216,6 +215,7 @@ func validWireHeaderFieldName(v string) bool {
 	return true
 }
 
+// TODO: avoid alloc when code is neither 200 nor 404.
 func httpCodeString(code int) string {
 	switch code {
 	case 200:
@@ -224,11 +224,6 @@ func httpCodeString(code int) string {
 		return "404"
 	}
 	return strconv.Itoa(code)
-}
-
-// from pkg io
-type stringWriter interface {
-	WriteString(s string) (n int, err error)
 }
 
 // A closeWaiter is like a sync.WaitGroup but only goes 1 to 0 (open to closed).
@@ -257,15 +252,14 @@ func (cw closeWaiter) Wait() {
 // idle memory usage with many connections.
 type bufferedWriter struct {
 	_           incomparable
-	group       synctestGroupInterface // immutable
-	conn        net.Conn               // immutable
-	bw          *bufio.Writer          // non-nil when data is buffered
-	byteTimeout time.Duration          // immutable, WriteByteTimeout
+	conn        net.Conn      // immutable
+	bw          *bufio.Writer // non-nil when data is buffered
+	byteTimeout time.Duration // immutable, WriteByteTimeout
+	werr        error
 }
 
-func newBufferedWriter(group synctestGroupInterface, conn net.Conn, timeout time.Duration) *bufferedWriter {
+func newBufferedWriter(conn net.Conn, timeout time.Duration) *bufferedWriter {
 	return &bufferedWriter{
-		group:       group,
 		conn:        conn,
 		byteTimeout: timeout,
 	}
@@ -280,7 +274,7 @@ func newBufferedWriter(group synctestGroupInterface, conn net.Conn, timeout time
 const bufWriterPoolBufferSize = 4 << 10
 
 var bufWriterPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return bufio.NewWriterSize(nil, bufWriterPoolBufferSize)
 	},
 }
@@ -293,12 +287,16 @@ func (w *bufferedWriter) Available() int {
 }
 
 func (w *bufferedWriter) Write(p []byte) (n int, err error) {
+	if w.werr != nil {
+		return 0, w.werr
+	}
 	if w.bw == nil {
 		bw := bufWriterPool.Get().(*bufio.Writer)
 		bw.Reset((*bufferedWriterTimeoutWriter)(w))
 		w.bw = bw
 	}
-	return w.bw.Write(p)
+	n, w.werr = w.bw.Write(p)
+	return n, w.werr
 }
 
 func (w *bufferedWriter) Flush() error {
@@ -306,34 +304,31 @@ func (w *bufferedWriter) Flush() error {
 	if bw == nil {
 		return nil
 	}
-	err := bw.Flush()
+	if w.werr != nil {
+		return w.werr
+	}
+	w.werr = bw.Flush()
 	bw.Reset(nil)
 	bufWriterPool.Put(bw)
 	w.bw = nil
-	return err
+	return w.werr
 }
 
 type bufferedWriterTimeoutWriter bufferedWriter
 
 func (w *bufferedWriterTimeoutWriter) Write(p []byte) (n int, err error) {
-	return writeWithByteTimeout(w.group, w.conn, w.byteTimeout, p)
+	return writeWithByteTimeout(w.conn, w.byteTimeout, p)
 }
 
 // writeWithByteTimeout writes to conn.
 // If more than timeout passes without any bytes being written to the connection,
 // the write fails.
-func writeWithByteTimeout(group synctestGroupInterface, conn net.Conn, timeout time.Duration, p []byte) (n int, err error) {
+func writeWithByteTimeout(conn net.Conn, timeout time.Duration, p []byte) (n int, err error) {
 	if timeout <= 0 {
 		return conn.Write(p)
 	}
 	for {
-		var now time.Time
-		if group == nil {
-			now = time.Now()
-		} else {
-			now = group.Now()
-		}
-		conn.SetWriteDeadline(now.Add(timeout))
+		conn.SetWriteDeadline(time.Now().Add(timeout))
 		nn, err := conn.Write(p[n:])
 		n += nn
 		if n == len(p) || nn == 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
@@ -382,51 +377,27 @@ type connectionStater interface {
 	ConnectionState() tls.ConnectionState
 }
 
-var sorterPool = sync.Pool{New: func() interface{} { return new(sorter) }}
+var sorterPool = sync.Pool{New: func() any { return new(sorter) }}
 
 type sorter struct {
 	v []string // owned by sorter
 }
 
-func (s *sorter) Len() int           { return len(s.v) }
-func (s *sorter) Swap(i, j int)      { s.v[i], s.v[j] = s.v[j], s.v[i] }
-func (s *sorter) Less(i, j int) bool { return s.v[i] < s.v[j] }
-
 // Keys returns the sorted keys of h.
 //
 // The returned slice is only valid until s used again or returned to
 // its pool.
-func (s *sorter) Keys(h http.Header) []string {
+func (s *sorter) Keys(h Header) []string {
 	keys := s.v[:0]
 	for k := range h {
 		keys = append(keys, k)
 	}
 	s.v = keys
-	sort.Sort(s)
+	slices.Sort(s.v)
 	return keys
-}
-
-func (s *sorter) SortStrings(ss []string) {
-	// Our sorter works on s.v, which sorter owns, so
-	// stash it away while we sort the user's buffer.
-	save := s.v
-	s.v = ss
-	sort.Sort(s)
-	s.v = save
 }
 
 // incomparable is a zero-width, non-comparable type. Adding it to a struct
 // makes that struct also non-comparable, and generally doesn't add
 // any size (as long as it's first).
 type incomparable [0]func()
-
-// synctestGroupInterface is the methods of synctestGroup used by Server and Transport.
-// It's defined as an interface here to let us keep synctestGroup entirely test-only
-// and not a part of non-test builds.
-type synctestGroupInterface interface {
-	Join()
-	Now() time.Time
-	NewTimer(d time.Duration) timer
-	AfterFunc(d time.Duration, f func()) timer
-	ContextWithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc)
-}
