@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,6 +101,12 @@ func TestEndToEndOverPipe(t *testing.T) {
 // compensate: the read loop never stops reading, and every write happens on its own
 // goroutine. Otherwise the two peers deadlock while ACKing each other's SETTINGS.
 func serveMinimalHTTP2(t *testing.T, conn net.Conn) {
+	serveHTTP2Connection(t, conn, 1, false)
+}
+
+// serveHTTP2Connection answers up to maxRequests requests, then optionally sends a GOAWAY so
+// the client has to treat the connection as unusable.
+func serveHTTP2Connection(t *testing.T, conn net.Conn, maxRequests int, goAway bool) {
 	br := bufio.NewReader(conn)
 	preface := make([]byte, len(ClientPreface))
 	if _, err := io.ReadFull(br, preface); err != nil {
@@ -109,26 +116,36 @@ func serveMinimalHTTP2(t *testing.T, conn net.Conn) {
 	fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
 
 	settingsSeen := make(chan struct{})
-	headersSeen := make(chan *MetaHeadersFrame, 1)
+	headersSeen := make(chan *MetaHeadersFrame, maxRequests)
 	go func() {
 		wfr := NewFramer(conn, bytes.NewReader(nil))
 		<-settingsSeen
 		if err := wfr.WriteSettings(); err != nil {
 			return
 		}
-		headers := <-headersSeen
-		var hbuf bytes.Buffer
-		henc := hpack.NewEncoder(&hbuf)
-		_ = henc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
-		_ = henc.WriteField(hpack.HeaderField{Name: "content-length", Value: "2"})
-		if err := wfr.WriteHeaders(HeadersFrameParam{
-			StreamID:      headers.StreamID,
-			BlockFragment: hbuf.Bytes(),
-			EndHeaders:    true,
-		}); err != nil {
-			return
+		for i := 0; i < maxRequests; i++ {
+			headers, ok := <-headersSeen
+			if !ok {
+				return
+			}
+			var hbuf bytes.Buffer
+			henc := hpack.NewEncoder(&hbuf)
+			_ = henc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+			_ = henc.WriteField(hpack.HeaderField{Name: "content-length", Value: "2"})
+			if err := wfr.WriteHeaders(HeadersFrameParam{
+				StreamID:      headers.StreamID,
+				BlockFragment: hbuf.Bytes(),
+				EndHeaders:    true,
+			}); err != nil {
+				return
+			}
+			if err := wfr.WriteData(headers.StreamID, true, []byte("ok")); err != nil {
+				return
+			}
 		}
-		_ = wfr.WriteData(headers.StreamID, true, []byte("ok"))
+		if goAway {
+			_ = wfr.WriteGoAway(0, ErrCodeNo, nil)
+		}
 	}()
 
 	for {
@@ -149,9 +166,67 @@ func serveMinimalHTTP2(t *testing.T, conn net.Conn) {
 		case *MetaHeadersFrame:
 			select {
 			case headersSeen <- f:
-			default:
 			}
 		}
+	}
+}
+
+// TestReconnectAfterGoAway pins the error contract of the connection-carrying
+// RoundTripper. net/http keeps an HTTP/2 connection and asks the fork to serve later
+// requests on it; when that connection has become unusable the fork must report
+// ErrNoCachedConn unchanged, which net/http recognises (IsHTTP2NoCachedConnError) and
+// answers with a fresh dial. Converting it to http.ErrSkipAltProtocol — as the
+// RegisterProtocol entry point legitimately does — surfaces "net/http: skip alternate
+// protocol" to the caller instead.
+func TestReconnectAfterGoAway(t *testing.T) {
+	cert := selfSignedCert(t)
+	var dials atomic.Int32
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dials.Add(1)
+		clientPipe, serverPipe := net.Pipe()
+		t.Cleanup(func() {
+			clientPipe.Close()
+			serverPipe.Close()
+		})
+		serverTLS := cryptotls.Server(serverPipe, &cryptotls.Config{
+			Certificates: []cryptotls.Certificate{cert},
+			NextProtos:   []string{NextProtoTLS},
+		})
+		// One request per connection, then GOAWAY, so every later request has to find a
+		// new connection.
+		go serveHTTP2Connection(t, serverTLS, 1, true)
+		return clientPipe, nil
+	}
+
+	t1 := &http.Transport{DialContext: dial, ForceAttemptHTTP2: true}
+	if err := ConfigureTransport(t1, Options{
+		Settings:        goldenSettings,
+		PHeaderOrder:    goldenPHeaderOrder,
+		HeaderOrder:     goldenHeaderOrder,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}); err != nil {
+		t.Fatalf("ConfigureTransport: %v", err)
+	}
+
+	client := &http.Client{Transport: t1, Timeout: 5 * time.Second}
+	for i := 0; i < 3; i++ {
+		req, err := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header = goldenHeader.Clone()
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || string(body) != "ok" {
+			t.Fatalf("request %d: response = %d %q", i, resp.StatusCode, body)
+		}
+	}
+	if got := dials.Load(); got < 3 {
+		t.Errorf("dialed %d times, want at least one dial per request", got)
 	}
 }
 

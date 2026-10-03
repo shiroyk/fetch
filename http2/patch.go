@@ -253,7 +253,11 @@ func configureTransports(t1 *http.Transport, opt ...Options) (*Transport, error)
 			// was unknown)
 			go c.Close()
 		}
-		return noDialH2RoundTripper{t: t2}
+		// The RoundTripper attached to a connection net/http already handed over must
+		// report ErrNoCachedConn unchanged: net/http retries a request with a fresh dial
+		// when it recognises that error. Only the RegisterProtocol entry point above
+		// converts it, because there the contract is http.ErrSkipAltProtocol.
+		return h2RoundTripper{t: t2}
 	}
 	if t1.TLSNextProto == nil {
 		t1.TLSNextProto = make(map[string]func(string, *cryptotls.Conn) http.RoundTripper)
@@ -293,6 +297,18 @@ func (rt noDialH2RoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 		return nil, http.ErrSkipAltProtocol
 	}
 	return res, err
+}
+
+// h2RoundTripper serves the requests net/http routes to a connection it already handed to
+// the fork through TLSNextProto. Unlike noDialH2RoundTripper it never converts errors into
+// http.ErrSkipAltProtocol: that sentinel is only meaningful where net/http is choosing
+// between the registered protocol and its own dial path, not once a connection exists.
+type h2RoundTripper struct {
+	t *Transport
+}
+
+func (rt h2RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return rt.t.roundTripHTTP(req)
 }
 
 type errRoundTripper struct{ err error }

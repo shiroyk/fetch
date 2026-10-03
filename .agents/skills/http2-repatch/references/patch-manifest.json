@@ -270,7 +270,8 @@
       ],
       "invariants": [
         "roundTripHTTP keeps Request, TLS, Trailer, ContentLength and Uncompressed on the response.",
-        "noDialH2RoundTripper returns http.ErrSkipAltProtocol when no conn is cached, never an error.",
+        "The two entry points have different error contracts and must not be merged: noDialH2RoundTripper (RegisterProtocol) converts ErrNoCachedConn, errClientConnUnusable and errClientConnGotGoAway into http.ErrSkipAltProtocol, because there net/http is choosing between the registered protocol and its own dial path.",
+        "h2RoundTripper (a connection net/http already handed over through TLSNextProto) reports ErrNoCachedConn unchanged: net/http recognises it through IsHTTP2NoCachedConnError and answers with a fresh dial. Converting it there surfaces 'net/http: skip alternate protocol' to the caller.",
         "registerHTTPSProtocol converts RegisterProtocol's panic into an error, as the old x/net transport did."
       ],
       "verify": ["scripts/verify.sh", "http2/patch_e2e_test.go"]
@@ -481,7 +482,7 @@
         },
         {
           "file": "http2/patch_e2e_test.go",
-          "symbol": "TestEndToEndOverPipe"
+          "symbol": "TestEndToEndOverPipe, TestReconnectAfterGoAway"
         }
       ],
       "anchors": [
@@ -494,7 +495,8 @@
         "The golden string equals SETTINGS|WINDOW_UPDATE|priority|pseudo-header codes.",
         "When the live profile changes, the tests change together.",
         "TestHackTlsConn drives a real uTLS handshake over net.Pipe against a crypto/tls server, so a Go release that renames the unexported crypto/tls.Conn fields fails offline.",
-        "TestEndToEndOverPipe asserts the 200 response plus the SETTINGS and header order seen on the wire, which proves net/http routes to TLSNextProto[\"h2\"] rather than its bundled HTTP/2."
+        "TestEndToEndOverPipe asserts the 200 response plus the SETTINGS and header order seen on the wire, which proves net/http routes to TLSNextProto[\"h2\"] rather than its bundled HTTP/2.",
+        "TestReconnectAfterGoAway drives a server that GOAWAYs after every response and asserts the client reconnects instead of surfacing net/http's alt-protocol sentinel."
       ],
       "verify": ["go test ./http2/ -count=1"]
     }

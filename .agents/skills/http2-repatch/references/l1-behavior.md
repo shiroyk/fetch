@@ -56,6 +56,7 @@ the fork-owned `patch.go`.
 | Header order, and upstream fallback | `TestGoldenHeaderOrder`, `TestGoldenHeaderOrderDefault` |
 | Forged conn shape | `TestHackTlsConn` |
 | net/http routing and options on the wire | `TestEndToEndOverPipe` |
+| Reconnect after GOAWAY, and the alt-protocol error contract | `TestReconnectAfterGoAway` |
 | Real handshake fingerprint | `EXTNET=1 go test ./http2/ -run TestFingerPrint` |
 
 ## When to stop
