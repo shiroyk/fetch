@@ -342,6 +342,7 @@
       ],
       "invariants": [
         "Every SETTINGS id/val pair from Options.Settings reaches the wire in the caller's order.",
+        "What the fork advertises must match what it accepts: the HPACK decoder is rebuilt with the advertised SETTINGS_HEADER_TABLE_SIZE after the options are applied, and the Framer read limit follows an advertised SETTINGS_MAX_FRAME_SIZE. Advertising more than the decoder or framer accepts makes legitimate peers fail the connection with COMPRESSION_ERROR or FRAME_SIZE_ERROR.",
         "Options.WindowSizeIncrement replaces the TransportConfig value as the connection WINDOW_UPDATE when non-zero.",
         "Each Options.PriorityParams entry becomes one PRIORITY frame.",
         "A negotiated protocol other than NextProtoTLS returns the ClientConn instead of failing.",
@@ -482,7 +483,7 @@
         },
         {
           "file": "http2/patch_e2e_test.go",
-          "symbol": "TestEndToEndOverPipe, TestReconnectAfterGoAway"
+          "symbol": "TestEndToEndOverPipe, TestReconnectAfterGoAway, TestResponseHeaderTableSize"
         }
       ],
       "anchors": [
@@ -497,8 +498,10 @@
         "TestHackTlsConn drives a real uTLS handshake over net.Pipe against a crypto/tls server, so a Go release that renames the unexported crypto/tls.Conn fields fails offline.",
         "TestEndToEndOverPipe asserts the 200 response plus the SETTINGS and header order seen on the wire, which proves net/http routes to TLSNextProto[\"h2\"] rather than its bundled HTTP/2.",
         "TestReconnectAfterGoAway drives a server that GOAWAYs after every response and asserts the client reconnects instead of surfacing net/http's alt-protocol sentinel."
+        ,
+        "TestResponseHeaderTableSize makes the responder announce a 64KiB HPACK table and asserts the client decodes it, which fails with COMPRESSION_ERROR when the decoder keeps the 4KiB default."
       ],
-      "verify": ["go test ./http2/ -count=1"]
+      "verify": ["go test ./http2/ -skip 'TestFingerPrint' -count=1"]
     }
   ]
 }

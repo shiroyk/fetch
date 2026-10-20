@@ -107,6 +107,14 @@ func serveMinimalHTTP2(t *testing.T, conn net.Conn) {
 // serveHTTP2Connection answers up to maxRequests requests, then optionally sends a GOAWAY so
 // the client has to treat the connection as unusable.
 func serveHTTP2Connection(t *testing.T, conn net.Conn, maxRequests int, goAway bool) {
+	serveHTTP2ConnectionWithTable(t, conn, maxRequests, goAway, 0)
+}
+
+// serveHTTP2ConnectionWithTable is serveHTTP2Connection with a server-side HPACK dynamic
+// table size. A non-zero tableSize makes the responder announce that size to the client
+// before its first header field, which a client that advertised a large
+// SETTINGS_HEADER_TABLE_SIZE must accept.
+func serveHTTP2ConnectionWithTable(t *testing.T, conn net.Conn, maxRequests int, goAway bool, tableSize uint32) {
 	br := bufio.NewReader(conn)
 	preface := make([]byte, len(ClientPreface))
 	if _, err := io.ReadFull(br, preface); err != nil {
@@ -130,6 +138,10 @@ func serveHTTP2Connection(t *testing.T, conn net.Conn, maxRequests int, goAway b
 			}
 			var hbuf bytes.Buffer
 			henc := hpack.NewEncoder(&hbuf)
+			if tableSize > 0 {
+				henc.SetMaxDynamicTableSizeLimit(tableSize)
+				henc.SetMaxDynamicTableSize(tableSize)
+			}
 			_ = henc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
 			_ = henc.WriteField(hpack.HeaderField{Name: "content-length", Value: "2"})
 			if err := wfr.WriteHeaders(HeadersFrameParam{
@@ -168,6 +180,56 @@ func serveHTTP2Connection(t *testing.T, conn net.Conn, maxRequests int, goAway b
 			case headersSeen <- f:
 			}
 		}
+	}
+}
+
+// TestResponseHeaderTableSize pins the decoder limit to the SETTINGS_HEADER_TABLE_SIZE the
+// client advertises. The fork sends the caller's SETTINGS verbatim, so a profile that
+// advertises a 64KiB HPACK table lets servers use a 64KiB table. If the client's decoder
+// is still created with the 4KiB default, such a server's dynamic table size update fails
+// to decode and the connection dies with COMPRESSION_ERROR.
+func TestResponseHeaderTableSize(t *testing.T) {
+	clientPipe, serverPipe := net.Pipe()
+	defer clientPipe.Close()
+	defer serverPipe.Close()
+
+	const tableSize = 65536
+	serverTLS := cryptotls.Server(serverPipe, &cryptotls.Config{
+		Certificates: []cryptotls.Certificate{selfSignedCert(t)},
+		NextProtos:   []string{NextProtoTLS},
+	})
+	go serveHTTP2ConnectionWithTable(t, serverTLS, 1, false, tableSize)
+
+	t1 := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return clientPipe, nil
+		},
+	}
+	if err := ConfigureTransport(t1, Options{
+		Settings: []Setting{
+			{ID: SettingHeaderTableSize, Val: tableSize},
+			{ID: SettingEnablePush, Val: 0},
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}); err != nil {
+		t.Fatalf("ConfigureTransport: %v", err)
+	}
+
+	client := &http.Client{Transport: t1, Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, "https://example.com/", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 }
 

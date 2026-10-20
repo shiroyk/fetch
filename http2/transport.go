@@ -716,8 +716,16 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool, internalStateHook 
 		}
 		if v := settingVal[SettingMaxFrameSize]; v > 0 {
 			cc.maxFrameSize = v
+			// The peer may now send frames this large, so the read limit must match
+			// what we advertised; otherwise legal frames are rejected.
+			cc.fr.SetMaxReadFrameSize(v)
 		}
 	}
+
+	// fork: site-new-client-conn. The decoder must accept the table size we are about to
+	// advertise. A peer that grows its HPACK dynamic table past the decoder's limit makes
+	// us fail the connection with COMPRESSION_ERROR.
+	cc.fr.ReadMetaHeaders = hpack.NewDecoder(maxHeaderTableSize, nil)
 
 	cc.bw.Write(clientPreface)
 	cc.fr.WriteSettings(settings...)

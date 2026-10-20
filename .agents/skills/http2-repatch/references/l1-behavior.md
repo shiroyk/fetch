@@ -12,6 +12,10 @@ an upstream change actually threatens the fingerprint.
 3. **The connection preface is caller-controlled.** SETTINGS entries reach the wire in the
    caller's order, the connection WINDOW_UPDATE uses `Options.WindowSizeIncrement` when
    non-zero, and each `Options.PriorityParams` entry becomes one PRIORITY frame.
+   Whatever the fork advertises it must also accept: the HPACK decoder is rebuilt with the
+   advertised header-table size, and the Framer read limit follows an advertised
+   MAX_FRAME_SIZE. A mismatch shows up as `CONNECTION_ERROR`/`COMPRESSION_ERROR` from peers
+   that use what we allowed.
 4. **Header order is caller-controlled.** `Options.PHeaderOrder` orders pseudo headers,
    `Options.HeaderOrder` orders regular headers, and neither set means upstream behaviour.
 5. **The forged conn keeps net/http routing to the fork.** `hackTlsConn` turns the uTLS
@@ -52,6 +56,7 @@ the fork-owned `patch.go`.
 | SETTINGS payload and order | `TestGoldenClientPrefaceFrames` |
 | WINDOW_UPDATE increment | `TestGoldenClientPrefaceFrames` |
 | No PRIORITY frames when `PriorityParams` is nil | `TestGoldenClientPrefaceFrames` |
+| Advertised HPACK table size is decodable | `TestResponseHeaderTableSize` |
 | Pseudo header order | `TestGoldenHeaderOrder` |
 | Header order, and upstream fallback | `TestGoldenHeaderOrder`, `TestGoldenHeaderOrderDefault` |
 | Forged conn shape | `TestHackTlsConn` |
